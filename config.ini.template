@@ -1,0 +1,4 @@
+[common]
+content-repo = git@example.com/bus-time-content.git
+signature-key-file = ~/.ssh/bustime
+publish-url = http://example.com/post
