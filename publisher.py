@@ -100,6 +100,11 @@ class DatabaseCollection:
 
     MIGRATION_FILE_TEMPLATE = '{0:02d}-to-{1:02d}.sql'
     DATABASE_FILE_TEMPLATE = '{}.db'
+    DATABASE_OPTIMIZATION_SCRIPT = '''
+        vacuum;
+        analyze;
+        reindex;
+    '''
 
     def __init__(self, script_dir, content_dir):
         self._script_dir = script_dir
@@ -121,10 +126,10 @@ class DatabaseCollection:
     def _create_current_schema_database(self):
         schema_version = self._read_schema_version()
         file_path = self._get_database_file_path(schema_version)
-        with sqlite3.connect(file_path) as connection:
-            self._execute_sql(connection, self._get_schema_file_path(self.TABLES_FILE))
-            self._execute_sql(connection, self._get_schema_file_path(self.INDICES_FILE))
+
+        self._create_database_schema(file_path)
         self._populate_database(file_path)
+        self._optimize_database(file_path)
 
         return Database(file_path, schema_version)
 
@@ -165,11 +170,20 @@ class DatabaseCollection:
             self.DATABASE_FILE_TEMPLATE.format(schema_version)
         )
 
+    def _create_database_schema(self, file_path):
+        with sqlite3.connect(file_path) as connection:
+            self._execute_sql(connection, self._get_schema_file_path(self.TABLES_FILE))
+            self._execute_sql(connection, self._get_schema_file_path(self.INDICES_FILE))
+
     def _execute_sql(self, connection, script_file_path):
         connection.executescript(self._read_text_file(script_file_path))
 
     def _populate_database(self, database_file_path):
         DatabaseContent(self._content_dir).populate_database(database_file_path)
+
+    def _optimize_database(self, file_path):
+        with sqlite3.connect(file_path) as connection:
+            connection.executescript(self.DATABASE_OPTIMIZATION_SCRIPT)
 
     def _can_migrate_from(self, database):
         if database.schema_version - 1 < self.MIN_SCHEMA_VERSION:
@@ -196,6 +210,8 @@ class DatabaseCollection:
                 self._execute_sql(
                     connection, self._get_migration_script_path(source_database.schema_version)
                 )
+
+            self._optimize_database(file_path)
 
             return Database(file_path, target_schema_version)
 
