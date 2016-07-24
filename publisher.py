@@ -227,22 +227,23 @@ class DatabaseContent:
     def populate_database(self, database_file_path):
         with Session(database_file_path) as session:
             TripType.init(session)
-            stops = self._populate_stops(session)
+
+            stops = self._build_stops()
+            session.add_all(stops)
+
             self._populate_routes(session, stops)
 
-    def _populate_stops(self, session):
-        stops = list()
-        for stop_item in self._read_stop_items():
-            stop = Stop(
-                key=stop_item['key'],
-                name=stop_item['name'],
-                direction=stop_item.get('direction'),
-                latitude=stop_item['latitude'],
-                longitude=stop_item['longitude']
-            )
-            stops.append(stop)
-        session.add_all(stops)
-        return stops
+    def _build_stops(self):
+        return [self._build_stop(x) for x in self._read_stop_items()]
+
+    def _build_stop(self, stop_item):
+        return Stop(
+            key=stop_item['key'],
+            name=stop_item['name'],
+            direction=stop_item.get('direction'),
+            latitude=stop_item['latitude'],
+            longitude=stop_item['longitude']
+        )
 
     def _read_stop_items(self):
         return self._read_yaml_items(self.STOP_DIR, self.STOPS_ROOT_KEY)
@@ -270,20 +271,21 @@ class DatabaseContent:
         for route_item in self._read_route_items():
             if route_item.get('hidden'):
                 continue
-            route = self._populate_route(session, route_item)
+
+            route = self._build_route(route_item)
+            session.add(route)
+
             self._populate_route_stops(session, route_item, route, stops)
             self._populate_trips(session, route_item, route)
 
     def _read_route_items(self):
         return self._read_yaml_items(self.ROUTE_DIR, self.ROUTES_ROOT_KEY)
 
-    def _populate_route(self, session, route_item):
-        route = Route(
+    def _build_route(self, route_item):
+        return Route(
             number=route_item['number'],
             description=route_item['description']
         )
-        session.add(route)
-        return route
 
     def _populate_route_stops(self, session, route_item, route, stops):
         for stop_item in route_item['stops']:
@@ -299,9 +301,7 @@ class DatabaseContent:
 
     def _parse_time(self, time_value):
         # Time scalar might get parsed as an sexagesimal integer
-        # (see http://yaml.org/spec/spec.html#id2561981).
-        # It is possibly better to enclose time values in quotes
-        # to explicitly cast it to string
+        # (see http://yaml.org/spec/spec.html#id2561981)
         if isinstance(time_value, int):
             return self._parse_time_as_int(time_value)
         elif isinstance(time_value, str):
