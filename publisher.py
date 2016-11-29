@@ -2,6 +2,7 @@
 # coding: utf-8
 
 
+import abc
 import base64
 import collections
 import configparser
@@ -15,7 +16,8 @@ import requests
 import sqlalchemy as sa
 import yaml
 from cryptography.hazmat.backends import default_backend as crypto_backend
-from cryptography.hazmat.primitives import hashes as crypto_hashes, serialization as crypto_serial
+from cryptography.hazmat.primitives import hashes as crypto_hashes
+from cryptography.hazmat.primitives import serialization as crypto_serial
 from cryptography.hazmat.primitives.asymmetric import padding as crypto_padding
 from sqlalchemy import orm
 from sqlalchemy.ext import declarative
@@ -23,27 +25,29 @@ from sqlalchemy.ext import declarative
 
 class Application:
     def run(self):
+        print('Working...')
         config = Config()
-
-        with tempfile.TemporaryDirectory() as content_dir:
-            self._clone_content(config.content_repo_url, content_dir)
-            version = self._get_version(content_dir)
-
-            with DatabaseCollection(config.script_dir, content_dir) as databases:
-                Publisher(version, databases, config.signature_key_file_path, config.publish_url).publish()
-
-    def _clone_content(self, source_url, target_dir):
-        subprocess.run(['git', 'clone', '--depth=1', source_url, target_dir], check=True)
-
-    def _get_version(self, repo_dir):
-        with CurrentDir(repo_dir):
-            return subprocess.check_output(['git', 'rev-parse', 'HEAD'], universal_newlines=True).strip()
+        with GitContentSource(config.content_repo_url) as content_source:
+            with DatabaseCollection(
+                config.current_schema_info_dir,
+                config.migration_script_dir,
+                content_source
+            ) as databases:
+                Publisher().publish(
+                    content_source.version,
+                    databases,
+                    FileUtils.read_binary(config.signature_key_file_path),
+                    config.publish_url
+                )
 
 
 class Config:
     ConfigKey = collections.namedtuple('ConfigKey', ['section', 'option'])
 
     CONFIG_FILE_NAME = 'config.ini'
+
+    CURRENT_SCHEMA_INFO_SUBDIR = 'schema'
+    MIGRATION_SCRIPT_SUBDIR = 'migrations'
 
     CONTENT_REPO_URL_KEY = ConfigKey('common', 'content-repo')
     SIGNATURE_KEY_FILE_PATH_KEY = ConfigKey('common', 'signature-key-file')
@@ -64,8 +68,16 @@ class Config:
         return os.path.dirname(os.path.realpath(__file__))
 
     @property
-    def script_dir(self):
-        return self._get_script_dir()
+    def current_schema_info_dir(self):
+        return os.path.join(
+            self._get_script_dir(), self.CURRENT_SCHEMA_INFO_SUBDIR
+        )
+
+    @property
+    def migration_script_dir(self):
+        return os.path.join(
+            self._get_script_dir(), self.MIGRATION_SCRIPT_SUBDIR
+        )
 
     @property
     def content_repo_url(self):
@@ -79,304 +91,88 @@ class Config:
 
     @property
     def signature_key_file_path(self):
-        return os.path.expanduser(self._get_option(self.SIGNATURE_KEY_FILE_PATH_KEY))
+        return os.path.expanduser(
+            self._get_option(self.SIGNATURE_KEY_FILE_PATH_KEY)
+        )
 
     @property
     def publish_url(self):
         return self._get_option(self.PUBLISH_URL_KEY)
 
 
-class DatabaseCollection:
-    MIGRATIONS_DIR = 'migrations'
-    SCHEMA_DIR = 'schema'
-    VERSION_FILE = 'version.txt'
-    TABLES_FILE = 'tables.sql'
-    INDICES_FILE = 'indices.sql'
-
-    ENCODING = 'utf8'
-
-    MIN_SCHEMA_VERSION = 1
-    MAX_SCHEMA_VERSION = 2 ** 31 - 1
-
-    MIGRATION_FILE_TEMPLATE = '{0:02d}-to-{1:02d}.sql'
-    DATABASE_FILE_TEMPLATE = '{}.db'
-    DATABASE_OPTIMIZATION_SCRIPT = '''
-        vacuum;
-        analyze;
-        reindex;
-    '''
-
-    def __init__(self, script_dir, content_dir):
-        self._script_dir = script_dir
-        self._content_dir = content_dir
-        self._database_dir_context = tempfile.TemporaryDirectory()
-
-    def __enter__(self):
-        self._database_dir = self._database_dir_context.__enter__()
-        return list(self._create_databases())
-
-    def _create_databases(self):
-        database = self._create_current_schema_database()
-        yield database
-
-        while self._can_migrate_from(database):
-            database = self._migrate(database)
-            yield database
-
-    def _create_current_schema_database(self):
-        schema_version = self._read_schema_version()
-        file_path = self._get_database_file_path(schema_version)
-
-        self._create_database_schema(file_path)
-        self._populate_database(file_path)
-        self._optimize_database(file_path)
-
-        return Database(file_path, schema_version)
-
-    def _read_schema_version(self):
-        schema_version_string = self._read_schema_version_string()
-
-        try:
-            return self._get_schema_version(schema_version_string)
-        except ValueError:
-            raise ValueError('Invalid schema version: “{}”.'.format(schema_version_string))
-
-    def _read_schema_version_string(self):
-        file_path = self._get_schema_file_path(self.VERSION_FILE)
-        return self._read_text_file(file_path)
-
-    def _get_schema_file_path(self, file_name):
-        return os.path.join(self._script_dir, self.SCHEMA_DIR, file_name)
-
-    def _read_text_file(self, file_path):
-        with open(file_path, 'r', encoding=self.ENCODING) as f:
-            return '\n'.join(f.readlines()).strip()
-
-    def _get_schema_version(self, schema_version_string):
-        schema_version = int(schema_version_string)
-
-        if not self._is_valid_schema_version(schema_version):
-            raise ValueError()
-
-        return schema_version
-
-    def _is_valid_schema_version(self, schema_version):
-        return (self.MIN_SCHEMA_VERSION <= schema_version <=
-                self.MAX_SCHEMA_VERSION)
-
-    def _get_database_file_path(self, schema_version):
-        return os.path.join(
-            self._database_dir,
-            self.DATABASE_FILE_TEMPLATE.format(schema_version)
-        )
-
-    def _create_database_schema(self, file_path):
-        with sqlite3.connect(file_path) as connection:
-            self._execute_sql(connection, self._get_schema_file_path(self.TABLES_FILE))
-            self._execute_sql(connection, self._get_schema_file_path(self.INDICES_FILE))
-
-    def _execute_sql(self, connection, script_file_path):
-        connection.executescript(self._read_text_file(script_file_path))
-
-    def _populate_database(self, database_file_path):
-        DatabaseContent(self._content_dir).populate_database(database_file_path)
-
-    def _optimize_database(self, file_path):
-        with sqlite3.connect(file_path) as connection:
-            connection.executescript(self.DATABASE_OPTIMIZATION_SCRIPT)
-
-    def _can_migrate_from(self, database):
-        if database.schema_version - 1 < self.MIN_SCHEMA_VERSION:
-            return False
-
-        if not os.path.exists(self._get_migration_script_path(database.schema_version)):
-            return False
-
-        return True
-
-    def _get_migration_script_path(self, source_version):
-        return os.path.join(
-            self._script_dir,
-            self.MIGRATIONS_DIR,
-            self.MIGRATION_FILE_TEMPLATE.format(source_version, source_version - 1)
-        )
-
-    def _migrate(self, source_database):
-        with CurrentDir(self._database_dir):
-            target_schema_version = source_database.schema_version - 1
-            file_path = self._get_database_file_path(target_schema_version)
-
-            with sqlite3.connect(file_path) as connection:
-                self._execute_sql(
-                    connection, self._get_migration_script_path(source_database.schema_version)
-                )
-
-            self._optimize_database(file_path)
-
-            return Database(file_path, target_schema_version)
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._database_dir_context.__exit__(exc_type, exc_val, exc_tb)
-
-
-class Database:
-    def __init__(self, file_path, schema_version):
-        self.file_path = file_path
-        self.schema_version = schema_version
-
-
-class DatabaseContent:
+class GitContentSource:
     STOP_DIR = 'content/stops'
     ROUTE_DIR = 'content/routes'
-    YAML_SUFFIX = '.yaml'
 
     STOPS_ROOT_KEY = 'stops'
     ROUTES_ROOT_KEY = 'routes'
 
-    ENCODING = 'utf8'
+    def __init__(self, repo_url):
+        self._repo_url = repo_url
+        self._content_dir_context = tempfile.TemporaryDirectory()
 
-    MIN_PER_HOUR = 60
+        self._loaded = False
+        self._version = None
+        self._route_item_source = None
+        self._stop_item_source = None
 
-    def __init__(self, content_dir):
-        self._content_dir = content_dir
+    def __enter__(self):
+        self._content_dir = self._content_dir_context.__enter__()
+        return self
 
-    def populate_database(self, database_file_path):
-        with Session(database_file_path) as session:
-            TripType.init(session)
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._content_dir_context.__exit__(exc_type, exc_val, exc_tb)
 
-            stops = self._build_stops()
-            session.add_all(stops)
+    @property
+    def version(self):
+        self._ensure_loaded()
+        return self._version
 
-            self._populate_routes(session, stops)
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
 
-    def _build_stops(self):
-        return [self._build_stop(x) for x in self._read_stop_items()]
+        self._clone()
 
-    def _build_stop(self, stop_item):
-        return Stop(
-            key=stop_item['key'],
-            name=stop_item['name'],
-            direction=stop_item.get('direction'),
-            latitude=stop_item['latitude'],
-            longitude=stop_item['longitude']
+        self._version = self._read_version()
+        self._route_item_source = self._get_yaml_item_source(
+            self.ROUTE_DIR, self.ROUTES_ROOT_KEY
+        )
+        self._stop_item_source = self._get_yaml_item_source(
+            self.STOP_DIR, self.STOPS_ROOT_KEY
         )
 
-    def _read_stop_items(self):
-        return self._read_yaml_items(self.STOP_DIR, self.STOPS_ROOT_KEY)
+        self._loaded = True
 
-    def _read_yaml_items(self, dir_name, root_item_name):
-        dir_path = os.path.join(self._content_dir, dir_name)
-
-        item_files = [os.path.join(dir_path, x) for x in os.listdir(dir_path)]
-        item_files = [
-            x for x in item_files
-            if os.path.splitext(x)[1] == self.YAML_SUFFIX and os.path.isfile(x)
-            ]
-        items = list()
-        for item_file in item_files:
-            self._read_item_file(items, item_file, root_item_name)
-
-        return items
-
-    def _read_item_file(self, target_list, item_file, root_item_name):
-        with open(item_file, 'r', encoding=self.ENCODING) as f:
-            loaded_dict = yaml.safe_load(f)
-            target_list += loaded_dict[root_item_name]
-
-    def _populate_routes(self, session, stops):
-        for route_item in self._read_route_items():
-            if route_item.get('hidden'):
-                continue
-
-            route = self._build_route(route_item)
-            session.add(route)
-
-            self._populate_route_stops(session, route_item, route, stops)
-            self._populate_trips(session, route_item, route)
-
-    def _read_route_items(self):
-        return self._read_yaml_items(self.ROUTE_DIR, self.ROUTES_ROOT_KEY)
-
-    def _build_route(self, route_item):
-        return Route(
-            number=route_item['number'],
-            description=route_item['description']
+    def _clone(self):
+        subprocess.run(
+            ['git', 'clone', '--depth=1', self._repo_url, self._content_dir],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
 
-    def _populate_route_stops(self, session, route_item, route, stops):
-        for stop_item in route_item['stops']:
-            stop = Stop.find_by_key(stops, stop_item['key'])
-            shift_hour, shift_minute = self._parse_time(stop_item['shift'])
-            route_stop = RouteStop(
-                route=route,
-                stop=stop,
-                shift_hour=shift_hour,
-                shift_minute=shift_minute
-            )
-            session.add(route_stop)
+    def _read_version(self):
+        with CurrentDir(self._content_dir):
+            return subprocess.check_output(
+                ['git', 'rev-parse', 'HEAD'],
+                universal_newlines=True,
+                stderr=subprocess.DEVNULL
+            ).strip()
 
-    def _parse_time(self, time_value):
-        # Time scalar might get parsed as an sexagesimal integer
-        # (see http://yaml.org/spec/spec.html#id2561981)
-        if isinstance(time_value, int):
-            return self._parse_time_as_int(time_value)
-        elif isinstance(time_value, str):
-            return self._parse_time_as_string(time_value)
-        else:
-            raise ValueError()
+    def _get_yaml_item_source(self, item_subdir, item_root_key):
+        route_dir = os.path.join(self._content_dir, item_subdir)
+        return FileYamlItemSource(route_dir, item_root_key)
 
-    def _parse_time_as_int(self, time_int):
-        return time_int // self.MIN_PER_HOUR, time_int % self.MIN_PER_HOUR
+    @property
+    def route_item_source(self):
+        self._ensure_loaded()
+        return self._route_item_source
 
-    def _parse_time_as_string(self, time_string):
-        try:
-            if len(time_string) != len('hh:mm'):
-                raise ValueError()
-        except:
-            raise
-
-        hour = self._to_positive_int(time_string[0:2])
-
-        separator = time_string[2:3]
-        if separator != ':':
-            raise ValueError()
-
-        minute = self._to_positive_int(time_string[3:5])
-        if not 0 <= minute <= 59:
-            raise ValueError()
-
-        return hour, minute
-
-    def _to_positive_int(self, string_value):
-        int_value = int(string_value)
-
-        if int_value < 0:
-            raise ValueError()
-
-        return int_value
-
-    def _populate_trips(self, session, route_item, route):
-        trip_types = [
-            ('workdays', TripType.work_days),
-            ('weekend', TripType.weekend),
-            ('everyday', TripType.everyday)
-        ]
-
-        for trip_type_key, trip_type in trip_types:
-            self._populate_trips_of_type(
-                session, route_item, route, trip_type_key, trip_type
-            )
-
-    def _populate_trips_of_type(self, session, route_item, route, trip_type_key, trip_type):
-        for trip_item in (route_item['trips'].get(trip_type_key) or list()):
-            hour, minute = self._parse_time(trip_item)
-            trip = Trip(
-                type=trip_type,
-                route=route,
-                hour=hour,
-                minute=minute
-            )
-            session.add(trip)
+    @property
+    def stop_item_source(self):
+        self._ensure_loaded()
+        return self._stop_item_source
 
 
 class CurrentDir:
@@ -391,12 +187,393 @@ class CurrentDir:
         os.chdir(self._original_dir)
 
 
+class DatabaseCollection:
+    def __init__(self, current_schema_info_dir, migration_script_dir,
+                 content_source):
+        self._current_schema_info_dir = current_schema_info_dir
+        self._migration_script_dir = migration_script_dir
+        self._content_source = content_source
+
+        self._target_dir_context = tempfile.TemporaryDirectory()
+
+    def __enter__(self):
+        self._target_dir = self._target_dir_context.__enter__()
+        return self.get()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._target_dir_context.__exit__(exc_type, exc_val, exc_tb)
+
+    def get(self):
+        current_schema_database = CurrentSchemaDatabase(
+            self._target_dir,
+            self._current_schema_info_dir,
+            self._content_source
+        )
+        yield current_schema_database
+
+        yield from self._get_old_schema_databases(
+            current_schema_database.schema_version
+        )
+
+    def _get_old_schema_databases(self, current_schema_version):
+        migrations = OldSchemaDatabase.get_migrations(
+            current_schema_version, self._migration_script_dir
+        )
+        return (
+            OldSchemaDatabase(self._target_dir, self._migration_script_dir, x)
+            for x in migrations
+        )
+
+
+class Database(abc.ABC):
+    DATABASE_OPTIMIZATION_SCRIPT = '''
+        vacuum;
+        analyze;
+        reindex;
+    '''
+    DATABASE_FILE_TEMPLATE = '{}.db'
+
+    @property
+    @abc.abstractmethod
+    def content(self):
+        pass
+
+    @property
+    @abc.abstractmethod
+    def schema_version(self):
+        pass
+
+    def _execute_script(self, connection, script_file_path):
+        connection.executescript(FileUtils.read_text(script_file_path))
+
+    def _optimize_database(self, file_path):
+        with sqlite3.connect(file_path) as connection:
+            connection.executescript(self.DATABASE_OPTIMIZATION_SCRIPT)
+
+    def _get_database_file_name(self, schema_version):
+        return self.DATABASE_FILE_TEMPLATE.format(schema_version)
+
+
+class FileUtils:
+    @classmethod
+    def read_binary(cls, file_path):
+        with open(file_path, mode='rb') as f:
+            return f.read()
+
+    @classmethod
+    def read_text(cls, file_path, encoding='utf-8'):
+        with open(file_path, mode='r', encoding=encoding) as f:
+            return f.read()
+
+
+class CurrentSchemaDatabase(Database):
+    SCHEMA_VERSION_FILE = 'version.txt'
+    TABLES_SCRIPT_FILE = 'tables.sql'
+    INDICES_SCRIPT_FILE = 'indices.sql'
+
+    def __init__(self, target_dir, schema_info_dir, content_source):
+        self._schema_version = self._read_schema_version(schema_info_dir)
+        self._file_path = os.path.join(
+            target_dir, self._get_database_file_name(self._schema_version)
+        )
+        self._create_database(schema_info_dir, content_source)
+
+    def _read_schema_version(self, schema_info_dir):
+        file_path = os.path.join(schema_info_dir, self.SCHEMA_VERSION_FILE)
+        return SchemaVersion.from_file(file_path).get_as_int()
+
+    @property
+    def content(self):
+        return FileUtils.read_binary(self._file_path)
+
+    @property
+    def schema_version(self):
+        return self._schema_version
+
+    def _create_database(self, schema_script_dir, content_source):
+        self._create_database_schema(schema_script_dir)
+        self._populate_database(content_source)
+        self._optimize_database(self._file_path)
+
+    def _create_database_schema(self, schema_script_dir):
+        with sqlite3.connect(self._file_path) as connection:
+            for file in (self.TABLES_SCRIPT_FILE, self.INDICES_SCRIPT_FILE):
+                self._execute_script(
+                    connection, os.path.join(schema_script_dir, file)
+                )
+
+    def _populate_database(self, content_source):
+        builder = CurrentSchemaDatabaseBuilder()
+        with Session(self._file_path) as session:
+            TripType.init(session)
+            stops = list(
+                builder.build_stops(content_source.stop_item_source)
+            )
+            session.add_all(stops)
+
+            built_routes = builder.build_routes(
+                content_source.route_item_source
+            )
+            for built_route in built_routes:
+                session.add(built_route.route)
+                session.add_all(builder.build_route_stops(built_route, stops))
+                session.add_all(builder.build_trips(built_route))
+
+
+class SchemaVersion:
+    MIN_SCHEMA_VERSION = 1
+    MAX_SCHEMA_VERSION = 2 ** 31 - 1
+
+    @classmethod
+    def from_text(cls, schema_version_text):
+        return SchemaVersion(schema_version_text)
+
+    @classmethod
+    def from_file(cls, file_path):
+        return cls.from_text(FileUtils.read_text(file_path))
+
+    def __init__(self, schema_version_text):
+        try:
+            self._schema_version = self._get_schema_version(schema_version_text)
+        except ValueError:
+            raise ValueError(
+                'Invalid schema version: “{}”.'.format(schema_version_text)
+            )
+
+    def _get_schema_version(self, schema_version_text):
+        schema_version = int(schema_version_text)
+
+        if not self._is_valid_schema_version(schema_version):
+            raise ValueError()
+
+        return schema_version
+
+    def _is_valid_schema_version(self, schema_version):
+        return (self.MIN_SCHEMA_VERSION <= schema_version <=
+                self.MAX_SCHEMA_VERSION)
+
+    def get_as_int(self):
+        return self._schema_version
+
+
+BuiltRoute = collections.namedtuple('BuiltRoute', ['route_item', 'route'])
+
+
+class CurrentSchemaDatabaseBuilder:
+    class StopItem:
+        KEY = 'key'
+        NAME = 'name'
+        DIRECTION = 'direction'
+        LATITUDE = 'latitude'
+        LONGITUDE = 'longitude'
+
+    class RouteItem:
+        HIDDEN = 'hidden'
+        NUMBER = 'number'
+        DESCRIPTION = 'description'
+        STOPS = 'stops'
+        TRIPS = 'trips'
+
+        class Stop:
+            KEY = 'key'
+            SHIFT = 'shift'
+
+        class Trip:
+            WORKDAYS = 'workdays'
+            WEEKEND = 'weekend'
+            EVERYDAY = 'everyday'
+
+    def build_stops(self, stop_item_source):
+        return (self._build_stop(x) for x in stop_item_source.get())
+
+    def _build_stop(self, stop_item):
+        return Stop(
+            key=stop_item[self.StopItem.KEY],
+            name=stop_item[self.StopItem.NAME],
+            direction=stop_item.get(self.StopItem.DIRECTION),
+            latitude=stop_item[self.StopItem.LATITUDE],
+            longitude=stop_item[self.StopItem.LONGITUDE]
+        )
+
+    def build_routes(self, route_item_source):
+        for route_item in self._get_route_items(route_item_source.get()):
+            route = self._build_route(route_item)
+            yield BuiltRoute(route_item=route_item, route=route)
+
+    def _get_route_items(self, route_items):
+        return (x for x in route_items if not x.get(self.RouteItem.HIDDEN))
+
+    def _build_route(self, route_item):
+        return Route(
+            number=route_item[self.RouteItem.NUMBER],
+            description=route_item[self.RouteItem.DESCRIPTION]
+        )
+
+    def build_route_stops(self, built_route, stops):
+        for stop_item in built_route.route_item[self.RouteItem.STOPS]:
+            stop = Stop.find_by_key(stops, stop_item[self.RouteItem.Stop.KEY])
+            yield self._build_route_stop(stop_item, built_route.route, stop)
+
+    def _build_route_stop(self, route_stop_item, route, stop):
+        shift_time = YamlTime.create(
+            route_stop_item[self.RouteItem.Stop.SHIFT]
+        )
+        return RouteStop(
+            route=route,
+            stop=stop,
+            shift_hour=shift_time.hour,
+            shift_minute=shift_time.minute
+        )
+
+    def build_trips(self, built_route):
+        for trip_type_key, trip_type in self._get_trip_types():
+            yield from self._build_trips_of_type(
+                built_route, trip_type_key, trip_type
+            )
+
+    def _get_trip_types(self):
+        return (
+            (self.RouteItem.Trip.WORKDAYS, TripType.work_days),
+            (self.RouteItem.Trip.WEEKEND,  TripType.weekend),
+            (self.RouteItem.Trip.EVERYDAY, TripType.everyday)
+        )
+
+    def _build_trips_of_type(self, built_route, trip_type_key, trip_type):
+        trip_groups = built_route.route_item[self.RouteItem.TRIPS]
+        for trip_item in (trip_groups.get(trip_type_key) or list()):
+            trip_time = YamlTime.create(trip_item)
+            yield Trip(
+                type=trip_type,
+                route=built_route.route,
+                hour=trip_time.hour,
+                minute=trip_time.minute
+            )
+
+
+class YamlItemSource(abc.ABC):
+    @abc.abstractmethod
+    def get(self):
+        pass
+
+
+class FileYamlItemSource(YamlItemSource):
+    YAML_SUFFIX = '.yaml'
+
+    def __init__(self, source_dir, root_key):
+        self._source_dir = source_dir
+        self._root_key = root_key
+
+    def get(self):
+        doc_files = (
+            os.path.join(self._source_dir, x)
+            for x in os.listdir(self._source_dir)
+        )
+        docs = (
+            FileUtils.read_text(x) for x in doc_files
+            if os.path.splitext(x)[1] == self.YAML_SUFFIX and os.path.isfile(x)
+        )
+
+        return StringYamlItemSource(docs, self._root_key).get()
+
+
+class StringYamlItemSource(YamlItemSource):
+    def __init__(self, docs, root_key):
+        self._docs = docs
+        self._root_key = root_key
+
+    def get(self):
+        result = []
+        for doc in self._docs:
+            result += self._read_doc(doc)
+        return result
+
+    def _read_doc(self, doc):
+        loaded_dict = yaml.safe_load(doc)
+        return loaded_dict[self._root_key]
+
+
+class YamlTime(abc.ABC):
+    def __init__(self):
+        self._hour = None
+        self._minute = None
+
+    @classmethod
+    def create(cls, source_value):
+        # Time scalar might get parsed as an sexagesimal integer
+        # (see http://yaml.org/spec/spec.html#id2561981)
+        if isinstance(source_value, int):
+            return IntYamlTime(source_value)
+        elif isinstance(source_value, str):
+            return StringYamlTime(source_value)
+        else:
+            raise ValueError()
+
+    @abc.abstractmethod
+    def _parse(self):
+        pass
+
+    @property
+    def hour(self):
+        if not self._hour:
+            self._parse()
+        return self._hour
+
+    @property
+    def minute(self):
+        if not self._minute:
+            self._parse()
+        return self._minute
+
+
+class StringYamlTime(YamlTime):
+    def __init__(self, source_string):
+        super().__init__()
+        self._source_string = source_string
+
+    def _parse(self):
+        try:
+            if len(self._source_string) != len('hh:mm'):
+                raise ValueError()
+        except:
+            raise
+
+        self._hour = self._to_positive_int(self._source_string[0:2])
+
+        separator = self._source_string[2:3]
+        if separator != ':':
+            raise ValueError()
+
+        self._minute = self._to_positive_int(self._source_string[3:5])
+        if not 0 <= self._minute <= 59:
+            raise ValueError()
+
+    def _to_positive_int(self, string_value):
+        int_value = int(string_value)
+
+        if int_value < 0:
+            raise ValueError()
+
+        return int_value
+
+
+class IntYamlTime(YamlTime):
+    MIN_PER_HOUR = 60
+
+    def __init__(self, source_int):
+        super().__init__()
+        self._source_int = source_int
+
+    def _parse(self):
+        self._hour = self._source_int // self.MIN_PER_HOUR
+        self._minute = self._source_int % self.MIN_PER_HOUR
+
+
 class Session:
     CONNECTION_STRING_TEMPLATE = 'sqlite+pysqlite:///{}'
 
-    def __init__(self, file_path):
+    def __init__(self, db_file_path):
         session_class = orm.sessionmaker(
-            bind=self._create_engine(self._create_db_url(file_path))
+            bind=self._create_engine(self._create_db_url(db_file_path))
         )
 
         self._session = session_class()
@@ -425,13 +602,6 @@ class Base:
 Base = declarative.declarative_base(cls=Base)
 
 
-class Route(Base):
-    __tablename__ = 'Routes'
-
-    number = sa.Column(sa.Text, nullable=False)
-    description = sa.Column(sa.Text, nullable=False)
-
-
 class TripType(Base):
     __tablename__ = 'TripTypes'
 
@@ -442,19 +612,29 @@ class TripType(Base):
     name = sa.Column(sa.Text, nullable=False)
 
     @classmethod
-    def init(cls, session):
+    def init(cls, session=None):
         cls.everyday = TripType(id=0, name='Не зависит от дня недели')
         cls.work_days = TripType(id=1, name='Работает только по рабочим дням')
         cls.weekend = TripType(id=2, name='Работает только по выходным дням')
 
-        session.add_all([cls.everyday, cls.work_days, cls.weekend])
+        if session:
+            session.add_all([cls.everyday, cls.work_days, cls.weekend])
+
+
+class Route(Base):
+    __tablename__ = 'Routes'
+
+    number = sa.Column(sa.Text, nullable=False)
+    description = sa.Column(sa.Text, nullable=False)
 
 
 class Trip(Base):
     __tablename__ = 'Trips'
 
-    type_id = sa.Column(sa.Integer, sa.ForeignKey('TripTypes._id'), nullable=False)
-    route_id = sa.Column(sa.Integer, sa.ForeignKey('Routes._id'), nullable=False)
+    type_id = sa.Column(sa.Integer, sa.ForeignKey('TripTypes._id'),
+                        nullable=False)
+    route_id = sa.Column(sa.Integer, sa.ForeignKey('Routes._id'),
+                         nullable=False)
     hour = sa.Column(sa.Integer, nullable=False)
     minute = sa.Column(sa.Integer, nullable=False)
 
@@ -489,7 +669,8 @@ class Stop(Base):
 class RouteStop(Base):
     __tablename__ = 'RoutesAndStops'
 
-    route_id = sa.Column(sa.Integer, sa.ForeignKey('Routes._id'), nullable=False)
+    route_id = sa.Column(sa.Integer, sa.ForeignKey('Routes._id'),
+                         nullable=False)
     stop_id = sa.Column(sa.Integer, sa.ForeignKey('Stops._id'), nullable=False)
     shift_hour = sa.Column(sa.Integer, nullable=False)
     shift_minute = sa.Column(sa.Integer, nullable=False)
@@ -498,58 +679,131 @@ class RouteStop(Base):
     stop = orm.relationship(Stop)
 
 
+class OldSchemaDatabase(Database):
+    MIGRATION_FILE_TEMPLATE = '{0:02d}-to-{1:02d}.sql'
+
+    @classmethod
+    def get_migrations(cls, current_schema_version, migration_script_dir):
+        schema_version = current_schema_version
+        while cls._can_migrate_from(schema_version, migration_script_dir):
+            yield Migration(
+                from_version=schema_version,
+                to_version=schema_version - 1
+            )
+            schema_version -= 1
+
+    @classmethod
+    def _can_migrate_from(cls, source_version, migration_script_dir):
+        if source_version - 1 < SchemaVersion.MIN_SCHEMA_VERSION:
+            return False
+
+        migration_script_path = cls._get_migration_script_path(
+            source_version, migration_script_dir
+        )
+        return os.path.exists(migration_script_path)
+
+    @classmethod
+    def _get_migration_script_path(cls, source_version, migration_script_dir):
+        return os.path.join(
+            migration_script_dir,
+            cls.MIGRATION_FILE_TEMPLATE.format(
+                source_version, source_version - 1
+            )
+        )
+
+    def __init__(self, target_dir, migration_script_dir, migration):
+        self._schema_version = migration.to_version
+        self._file_path = os.path.join(
+            target_dir, self._get_database_file_name(self._schema_version)
+        )
+        self._migrate(target_dir, migration_script_dir, migration)
+
+    @property
+    def content(self):
+        return FileUtils.read_binary(self._file_path)
+
+    @property
+    def schema_version(self):
+        return self._schema_version
+
+    def _migrate(self, target_dir, migration_script_dir, migration):
+        with CurrentDir(target_dir):
+            with sqlite3.connect(self._file_path) as connection:
+                self._execute_script(
+                    connection,
+                    self._get_migration_script_path(
+                        migration.from_version,
+                        migration_script_dir
+                    )
+                )
+
+        self._optimize_database(self._file_path)
+
+
+Migration = collections.namedtuple('Migration', ['from_version', 'to_version'])
+
+
 class Publisher:
     UTF8_ENCODING = 'utf-8'
     SIGNATURE_HEADER = 'X-Content-Signature'
+    LOCATION_HEADER = 'Location'
 
-    def __init__(self, version, databases, key_file_path, target_url):
-        self._version = version
-        self._databases = databases
-        self._key_file_path = key_file_path
-        self._target_url = target_url
+    REDIRECTED_RESPONSE_TEMPLATE = (
+        'Failed.\n'
+        '{} {}.\n'
+        'Request has been redirected from ‘{}’ to ‘{}’.'
+    )
+    SUCCEEDED_RESPONSE_MESSAGE = 'Done.'
+    FAILED_RESPONSE_TEMPLATE = 'Failed.\n{}.'
 
-    def publish(self):
-        content_json = self._build_content_json()
-        content_signature = self._sign_content(content_json, self._key_file_path)
+    def publish(self, version, databases, private_key_binary, target_url):
+        request_body = self._build_request_body(version, databases)
+        signature = self._sign_request_body(
+            request_body, private_key_binary
+        )
 
         response = requests.post(
-            self._target_url,
-            headers={self.SIGNATURE_HEADER: content_signature},
-            data=content_json.encode(self.UTF8_ENCODING)
+            target_url,
+            headers={self.SIGNATURE_HEADER: signature},
+            data=request_body.encode(self.UTF8_ENCODING),
+            allow_redirects=False
         )
-        print(response)
+        self._handle_response(response)
 
-    def _build_content_json(self):
-        content = dict(
-            version=self._version,
+    def _build_request_body(self, version, databases):
+        request_body = dict(
+            version=version,
             schema_versions=[
                 dict(
                     schema_version=x.schema_version,
-                    content=Base64.binary_to_base64_str(self._read_binary_file(x.file_path))
+                    content=Base64.binary_to_base64_str(x.content)
                 )
-                for x in self._databases
-                ]
+                for x in databases
+            ]
         )
 
-        return json.dumps(content)
+        return json.dumps(request_body)
 
-    def _read_binary_file(self, file_path):
-        with open(file_path, 'rb') as f:
-            return f.read()
+    def _sign_request_body(self, request_body, private_key_binary):
+        body_binary = request_body.encode(self.UTF8_ENCODING)
+        signature_binary = Signature(private_key_binary).sign(body_binary)
+        return Base64.binary_to_base64_str(signature_binary)
 
-    def _sign_content(self, content_json, key_file_path):
-        key_binary = self._read_binary_file(key_file_path)
+    def _handle_response(self, response):
+        print(self._get_response_status_message(response))
 
-        private_key = crypto_serial.load_pem_private_key(
-            key_binary, password=None, backend=crypto_backend()
-        )
-        signer = private_key.signer(
-            crypto_padding.PKCS1v15(), crypto_hashes.SHA512()
-        )
-
-        signer.update(content_json.encode(self.UTF8_ENCODING))
-
-        return Base64.binary_to_base64_str(signer.finalize())
+    def _get_response_status_message(self, response):
+        if response.is_redirect:
+            return self.REDIRECTED_RESPONSE_TEMPLATE.format(
+                response.status_code,
+                response.reason,
+                response.url,
+                response.headers[self.LOCATION_HEADER]
+            )
+        if response.ok:
+            return self.SUCCEEDED_RESPONSE_MESSAGE
+        else:
+            return self.FAILED_RESPONSE_TEMPLATE.format(response.text)
 
 
 class Base64:
@@ -568,6 +822,22 @@ class Base64:
             return None
 
         return base64.b64decode(base64_str.encode(cls.ASCII_ENCODING))
+
+
+class Signature:
+    def __init__(self, private_key_binary):
+        self._private_key = crypto_serial.load_pem_private_key(
+            private_key_binary, password=None, backend=crypto_backend()
+        )
+
+    def sign(self, message_binary):
+        signer = self._private_key.signer(
+            crypto_padding.PKCS1v15(), crypto_hashes.SHA512()
+        )
+
+        signer.update(message_binary)
+
+        return signer.finalize()
 
 
 if __name__ == '__main__':
