@@ -6,18 +6,21 @@ A tool to publish Bus Time content to Bus Time backend server.
 
 Python 3.4 — 3.5 is required.
 
-First, resolve dependencies:
-```
-$ pip install -r requirements.txt
-```
+1. Resolve dependencies:
 
-Then create a configuration file from template:
-```
-$ cp config.ini.template config.ini
-$ vi config.ini
-```
+  ```
+  $ pip install -r requirements.txt
+  ```
 
-Finally, run the publisher:
-```
-$ python publisher.py
-```
+2. Create a configuration file from template:
+
+  ```
+  $ cp config.ini.template config.ini
+  $ vi config.ini
+  ```
+
+3. Run the publisher:
+
+  ```
+  $ python publisher.py
+  ```
